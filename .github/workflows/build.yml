@@ -186,7 +186,163 @@ jobs:
           rm -rf work-remix
           mkdir -p work-remix
           tar -xzf "$ARCHIVE" -C work-remix
-          echo "Generated sources unpacked."
+
+          # Rename generated sub_<hex> functions to the manual _gen convention.
+          #
+          # The generated bodies define sub_XXXX; the hand-written manual layer
+          # and the dispatch table reference sub_XXXX_gen. This rename is what
+          # makes those agree. Without it the link fails with thousands of
+          # "symbol(s) not found" for _sub_XXXX_gen.
+          #
+          # The read MUST fully complete before the file is opened for writing:
+          # open(p, "w").write(re.sub(..., open(p).read())) truncates the file
+          # before the read runs, leaving every generated .c empty.
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          d = "work-remix/gen"
+
+          if not os.path.isdir(d):
+              sys.exit(f"::error::generated source directory not found: {d}")
+
+          sources = sorted(f for f in os.listdir(d) if f.endswith(".c"))
+          if not sources:
+              sys.exit(f"::error::no generated .c sources found in {d}")
+
+          pattern = re.compile(r"\bsub_([0-9A-Fa-f]+)\b")
+          processed = 0
+          empty_after = []
+          shrank = []
+
+          for name in sources:
+              path = os.path.join(d, name)
+
+              with open(path, encoding="utf-8") as handle:
+                  src = handle.read()
+
+              before_bytes = len(src.encode("utf-8"))
+              if before_bytes == 0:
+                  empty_after.append(name)
+                  continue
+
+              out = pattern.sub(r"sub_\1_gen", src)
+              after_bytes = len(out.encode("utf-8"))
+
+              with open(path, "w", encoding="utf-8") as handle:
+                  handle.write(out)
+
+              if os.path.getsize(path) == 0:
+                  empty_after.append(name)
+                  continue
+              if after_bytes < before_bytes // 2:
+                  shrank.append(f"{name} {before_bytes}->{after_bytes}")
+              processed += 1
+
+          print(f"Generated .c sources found: {len(sources)}")
+          print(f"Generated .c sources renamed: {processed}")
+
+          if empty_after:
+              print(f"::error::empty generated sources: {', '.join(empty_after)}")
+              sys.exit(1)
+          if processed != len(sources):
+              print(f"::error::renamed {processed} of {len(sources)} sources")
+              sys.exit(1)
+          if shrank:
+              print("::error::sources shrank unexpectedly: " + ", ".join(shrank))
+              sys.exit(1)
+          # The header declares every translated function and is a separate
+          # file, so it must be renamed with the same pattern or the _gen
+          # references have no declaration. Runs after the .c loop so header
+          # and bodies always agree, and touches one file so the rename cannot
+          # be applied twice.
+          header_name = "recomp_funcs.h"
+          header_path = os.path.join(d, header_name)
+
+          if not os.path.isfile(header_path):
+              sys.exit(f"::error::{header_name} missing from generated sources")
+
+          with open(header_path, encoding="utf-8") as handle:
+              header_src = handle.read()
+
+          header_before_bytes = len(header_src.encode("utf-8"))
+          if header_before_bytes == 0:
+              sys.exit(f"::error::{header_name} is empty before rename")
+          if "sub_" not in header_src:
+              sys.exit(f"::error::{header_name} has no sub_ declarations")
+
+          header_out = pattern.sub(r"sub_\1_gen", header_src)
+
+          with open(header_path, "w", encoding="utf-8") as handle:
+              handle.write(header_out)
+
+          header_after_bytes = os.path.getsize(header_path)
+          if header_after_bytes == 0:
+              sys.exit(f"::error::{header_name} was truncated by the rename")
+
+          with open(header_path, encoding="utf-8") as handle:
+              header_check = handle.read()
+
+          header_after_chars = len(header_check.encode("utf-8"))
+          if header_after_chars < header_before_bytes:
+              sys.exit("::error::{} shrank {}->{} bytes during rename".format(
+                  header_name, header_before_bytes, header_after_chars))
+
+          if "_gen_gen" in header_check:
+              sys.exit(f"::error::{header_name} gained a double _gen suffix")
+
+          declared_gen = len(re.findall(
+              r"^\s*void\s+sub_[0-9A-Fa-f]+_gen\s*\(\s*void\s*\)\s*;",
+              header_check, re.M))
+          if declared_gen == 0:
+              sys.exit(f"::error::{header_name} declares no _gen functions after rename")
+
+          # xbe_entry_point is defined un-suffixed in the bodies, so the header
+          # must keep declaring it that way.
+          if "void xbe_entry_point(void);" not in header_check:
+              sys.exit(f"::error::{header_name} lost the xbe_entry_point declaration")
+          if "xbe_entry_point_gen" in header_check:
+              sys.exit(f"::error::{header_name} suffixed xbe_entry_point")
+
+          print(f"Generated header renamed: {header_name}")
+          print(f"  chars {header_before_bytes} -> {header_after_chars}")
+          print(f"  _gen declarations: {declared_gen}")
+          PY
+
+          # Re-assert on disk, outside Python, that the sources still hold code.
+          if find work-remix/gen -name '*.c' -empty | grep -q .; then
+            echo "::error::generated sources are empty after rename"
+            exit 1
+          fi
+          GEN_C_COUNT="$(find work-remix/gen -name '*.c' | wc -l | tr -d ' ')"
+          GEN_C_BYTES="$(find work-remix/gen -name '*.c' -exec cat {} + | wc -c | tr -d ' ')"
+          echo "Generated files: $GEN_C_COUNT"
+          echo "Generated bytes: $GEN_C_BYTES"
+          if [ "$GEN_C_COUNT" -eq 0 ] || [ "$GEN_C_BYTES" -eq 0 ]; then
+            echo "::error::generated sources are missing or empty"
+            exit 1
+          fi
+          if [ ! -s work-remix/gen/recomp_funcs.h ]; then
+            echo "::error::recomp_funcs.h is missing or empty after rename"
+            exit 1
+          fi
+          GEN_HDR_GEN_DECLS="$(grep -c -E '^[[:space:]]*void[[:space:]]+sub_[0-9A-Fa-f]+_gen[[:space:]]*[(][[:space:]]*void[[:space:]]*[)][[:space:]]*;' work-remix/gen/recomp_funcs.h || true)"
+          echo "Header _gen declarations: $GEN_HDR_GEN_DECLS"
+          if [ "$GEN_HDR_GEN_DECLS" -eq 0 ]; then
+            echo "::error::recomp_funcs.h declares no _gen functions after rename"
+            exit 1
+          fi
+          if grep -q '_gen_gen' work-remix/gen/recomp_funcs.h; then
+            echo "::error::recomp_funcs.h has a double _gen suffix"
+            exit 1
+          fi
+          if ! grep -q 'void xbe_entry_point(void);' work-remix/gen/recomp_funcs.h; then
+            echo "::error::recomp_funcs.h lost the xbe_entry_point declaration"
+            exit 1
+          fi
+
+          echo "Generated sources unpacked and renamed."
 
       - name: Configure iOS game
         working-directory: ios/game
