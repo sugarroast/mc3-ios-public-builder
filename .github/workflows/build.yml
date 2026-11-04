@@ -1,0 +1,267 @@
+name: MC3 iOS Build (public orchestrator)
+
+# Purpose
+# -------
+# GitHub Actions minutes are free and unmetered for *public* repositories when
+# using standard GitHub-hosted runners. This repository exists solely to host
+# that trigger. Source code, generated (decompiled) code, the XBE/ISO and all
+# game assets stay in PRIVATE repositories and are fetched at build time with a
+# read-only token. Nothing proprietary is committed here.
+#
+# Trigger: workflow_dispatch only. There is deliberately no push, no
+# pull_request and no pull_request_target. A run can therefore only be started
+# by someone with write access to this repository, which is what makes handing
+# it a token safe: a fork cannot start a run that receives secrets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      private_ref:
+        description: "Branch or commit SHA in the private source repo to build"
+        required: false
+        default: "ios-port"
+        type: string
+      upload_ipa:
+        description: "Upload the unsigned .ipa artifact"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mc3-ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build iOS arm64 game (private source)
+    # Standard GitHub-hosted macOS runner. Explicitly NOT a larger runner:
+    # GitHub bills larger runners even for public repositories, which would
+    # defeat the purpose of this repository.
+    runs-on: macos-15-intel
+
+    env:
+      # --- private repositories (read-only access via READ_TOKEN) -----------
+      PRIVATE_SOURCE_REPO: sugarroast/mc3dub-ios
+      PRIVATE_INPUTS_REPO: sugarroast/mc3-remix-build-inputs
+      PRIVATE_INPUTS_TAG: remix-usa-lift-v1
+      PRIVATE_INPUTS_ASSET: mc3-remix-usa-generated.tar.gz
+      PRIVATE_INPUTS_SHA256: 8a5c5c4afccd03f2bc927c9b0dc7d07ddb12a03d66f8062772d9cf0d60251494
+
+      # --- pinned build dependencies --------------------------------------
+      CMAKE_VERSION: 3.27.9
+      SDL2_COMMIT: 5d249570393f7a37e037abf22cd6012a4cc56a71
+      MOLTENVK_VERSION: 1.4.2
+      MOLTENVK_ASSET_URL: https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-ios.tar
+      MOLTENVK_SHA256: b5d947b1660e6e9fed40b9cd2387e160aaab9e80b775c0cef7e14059405178c1
+      GLSLANG_TAG: 15.1.0
+
+      MC3_GAME: remix
+      MC3_GEN_DIR: ${{ github.workspace }}/work-remix/gen
+      BUILD_DIR: ${{ github.workspace }}/ios/game/build/ios-device
+      MC3_SDL2_SOURCE_DIR: ${{ github.workspace }}/.deps/SDL2
+      MC3_MOLTENVK_PACKAGE_DIR: ${{ github.workspace }}/.deps/MoltenVK-1.4.2
+      MC3_GLSLANG_SOURCE_DIR: ${{ github.workspace }}/.deps/glslang
+
+    steps:
+      - name: Validate token is present
+        shell: bash
+        env:
+          READ_TOKEN: ${{ secrets.MC3_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${READ_TOKEN:-}" ]; then
+            echo "::error::secret MC3_PRIVATE_READ_TOKEN is not configured on this repository"
+            echo "::error::Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Read token is present."
+
+      - name: Check out private source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: sugarroast/mc3dub-ios
+          ref: ${{ inputs.private_ref }}
+          token: ${{ secrets.MC3_PRIVATE_READ_TOKEN }}
+          fetch-depth: 1
+          # Do NOT persist the token into .git/config: later steps run
+          # third-party build scripts and must not have a reusable credential
+          # lying around in the workspace.
+          persist-credentials: false
+
+      - name: Record source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "Built from ${PRIVATE_SOURCE_REPO}@${SHA}"
+          echo "SOURCE_SHA=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Check out pinned SDL2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: libsdl-org/SDL
+          ref: 5d249570393f7a37e037abf22cd6012a4cc56a71
+          path: .deps/SDL2
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Check out glslang (pinned tag)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: KhronosGroup/glslang
+          ref: 15.1.0
+          path: .deps/glslang
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/cmake-venv"
+          "$RUNNER_TEMP/cmake-venv/bin/python" -m pip install \
+            --disable-pip-version-check "cmake==$CMAKE_VERSION"
+          CMAKE_BIN="$RUNNER_TEMP/cmake-venv/bin/cmake"
+          "$CMAKE_BIN" --version | grep -F "cmake version $CMAKE_VERSION"
+          echo "CMAKE_BIN=$CMAKE_BIN" >> "$GITHUB_ENV"
+
+      - name: Download and SHA-verify MoltenVK
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARBALL="$RUNNER_TEMP/MoltenVK-ios.tar"
+          curl -fsSL -o "$TARBALL" "$MOLTENVK_ASSET_URL"
+          echo "$MOLTENVK_SHA256  $TARBALL" | shasum -a 256 -c -
+          mkdir -p "${{ github.workspace }}/.deps/MoltenVK-1.4.2"
+          tar -xf "$TARBALL" -C "${{ github.workspace }}/.deps/MoltenVK-1.4.2"
+
+      - name: Download private generated code
+        shell: bash
+        env:
+          READ_TOKEN: ${{ secrets.MC3_PRIVATE_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The token arrives via env and is masked, so it never appears in
+          # logs, and never on a command line where the process table shows it.
+          GH_TOKEN="$(printf '%s' "$READ_TOKEN" | tr -d '[:space:]')"
+          echo "::add-mask::$GH_TOKEN"
+          export GH_TOKEN
+
+          RELEASE_JSON="$RUNNER_TEMP/release.json"
+          curl --fail --location --silent --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PRIVATE_INPUTS_REPO}/releases/tags/${PRIVATE_INPUTS_TAG}" \
+            --output "$RELEASE_JSON"
+
+          ASSET_ID="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next((str(a["id"]) for a in d.get("assets",[]) if a.get("name")==sys.argv[2]), ""))' \
+            "$RELEASE_JSON" "$PRIVATE_INPUTS_ASSET")"
+          if [ -z "$ASSET_ID" ]; then
+            echo "::error::asset ${PRIVATE_INPUTS_ASSET} not found in release ${PRIVATE_INPUTS_TAG}"
+            exit 1
+          fi
+
+          ARCHIVE="$RUNNER_TEMP/${PRIVATE_INPUTS_ASSET}"
+          curl --fail --location --silent --show-error \
+            -H "Accept: application/octet-stream" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${PRIVATE_INPUTS_REPO}/releases/assets/${ASSET_ID}" \
+            --output "$ARCHIVE"
+
+          test -s "$ARCHIVE" || { echo "::error::downloaded archive is empty"; exit 1; }
+          ACTUAL_SHA="$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')"
+          echo "Archive size: $(ls -lh "$ARCHIVE" | awk '{print $5}')"
+          echo "SHA256: $ACTUAL_SHA"
+          if [ "$ACTUAL_SHA" != "$PRIVATE_INPUTS_SHA256" ]; then
+            echo "::error::SHA256 mismatch for ${PRIVATE_INPUTS_ASSET}"
+            exit 1
+          fi
+
+          rm -rf work-remix
+          mkdir -p work-remix
+          tar -xzf "$ARCHIVE" -C work-remix
+          echo "Generated sources unpacked."
+
+      - name: Configure iOS game
+        working-directory: ios/game
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$CMAKE_BIN" --preset ios-device
+
+      - name: Build game
+        id: build-game
+        shell: bash
+        run: |
+          set -o pipefail
+          "$CMAKE_BIN" --build "$BUILD_DIR" --config Release 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ios-game-build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Package IPA
+        if: success() && inputs.upload_ipa
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$(find "$BUILD_DIR" -name '*.app' -type d | head -n 1)"
+          test -d "$APP" || { echo "::error::no .app produced"; exit 1; }
+          test -f "$APP/Info.plist" || { echo "::error::missing Info.plist"; exit 1; }
+
+          EXECUTABLE="$(plutil -extract CFBundleExecutable raw -o - "$APP/Info.plist")"
+          test -n "$EXECUTABLE" || { echo "::error::empty CFBundleExecutable"; exit 1; }
+          test -f "$APP/$EXECUTABLE" || { echo "::error::executable missing"; exit 1; }
+
+          rm -rf "$RUNNER_TEMP/ipa"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          ( cd "$RUNNER_TEMP/ipa" && zip -qr "$RUNNER_TEMP/mc3-ios-game.ipa" Payload )
+
+          python3 - "$RUNNER_TEMP/mc3-ios-game.ipa" <<'PY'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          names = z.namelist()
+          assert any(n.startswith('Payload/') and n.endswith('.app/Info.plist')
+                     for n in names), 'missing Info.plist'
+          print('IPA entries:', len(names))
+          PY
+          echo "IPA size: $(du -h "$RUNNER_TEMP/mc3-ios-game.ipa" | cut -f1)"
+
+      - name: Upload IPA
+        if: success() && inputs.upload_ipa
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mc3-ios-game-ipa
+          path: ${{ runner.temp }}/mc3-ios-game.ipa
+          if-no-files-found: error
+          # Artifacts of a public repository are downloadable by anyone who can
+          # see the run. Keep the retention window short, download promptly,
+          # and delete the artifact once it has been fetched.
+          retention-days: 3
+
+      - name: Clean workspace
+        if: always()
+        shell: bash
+        run: |
+          # Leave no private source, generated code or credential behind on the
+          # runner (runners are ephemeral, but this also keeps artifact upload
+          # steps from ever being able to pick these up by accident).
+          rm -rf "${{ github.workspace }}/work-remix" \
+                 "${{ github.workspace }}/.deps" \
+                 "${{ github.workspace }}/src" \
+                 "${{ github.workspace }}/ios" \
+                 "${{ github.workspace }}/xboxrecomp" \
+                 "${{ github.workspace }}/config" 2>/dev/null || true
+          echo "Workspace cleaned."
