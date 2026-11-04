@@ -41,14 +41,21 @@ jobs:
     # GitHub bills larger runners even for public repositories, which would
     # defeat the purpose of this repository.
     #
-    # arm64 (macos-15), not macos-15-intel. The runner-images table maps
-    # macos-15 to the arm64 image and macos-15-intel to the x64 one; either
-    # works, because the target is iOS arm64 and the runner only has to
-    # cross-compile. Nothing here needs Intel: CMake comes from a Python venv,
-    # SDL2 and glslang are built from source, and the MoltenVK tarball is an
-    # iOS binary. There are no /usr/local paths and no brew calls that differ
-    # between the two images, so the arm64 pool is the one worth using.
-    runs-on: macos-15
+    # arm64 via macos-26 -- the image `macos-latest` now points at, so it is
+    # the pool GitHub provisions most of. The target is iOS arm64 and the
+    # runner only cross-compiles, so its own architecture does not matter;
+    # nothing here needs Intel: CMake comes from a Python venv, SDL2 and
+    # glslang are built from source, and the MoltenVK tarball is an iOS
+    # binary. There are no /usr/local paths and no brew calls that differ
+    # between images.
+    #
+    # Not macos-15: on 2026-11-04, after the Actions outage had cleared, four
+    # runs on that label sat with no runner assigned at all -- the last was
+    # cancelled after 15 minutes with zero steps executed -- while every
+    # earlier macos-15-intel run had been picked up within a minute. The
+    # older arm64 image is on its way to deprecation, so macos-26 is both
+    # arm64 and the pool that actually serves jobs.
+    runs-on: macos-26
 
     env:
       # --- private repositories (read-only access via READ_TOKEN) -----------
