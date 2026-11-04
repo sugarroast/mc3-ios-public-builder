@@ -41,16 +41,20 @@ jobs:
     # GitHub bills larger runners even for public repositories, which would
     # defeat the purpose of this repository.
     #
-    # arm64, not macos-15-intel. The target is iOS arm64 on a device, so the
-    # runner's own architecture only has to cross-compile, and the arm64
-    # image is the default pool -- macos-15-intel is the scarce label, and a
-    # run that waits for it never starts: on 2026-11-04 two runs sat at
-    # "Waiting for a runner to pick up this job..." for over 25 minutes after
-    # eleven earlier ones on the same label had completed. Nothing in this
-    # workflow needs Intel: CMake comes from a Python venv, SDL2 and glslang
-    # are built from source, and the MoltenVK tarball is an iOS binary. There
-    # are no /usr/local paths and no brew calls to differ between the images.
-    runs-on: macos-15
+    # macos-15-intel, not macos-15. Both are valid labels (the runner-images
+    # table maps macos-15 to the arm64 image and macos-15-intel to the x64
+    # one), and the target is iOS arm64 either way -- the runner only has to
+    # cross-compile, and nothing here needs Intel: CMake comes from a Python
+    # venv, SDL2 and glslang are built from source, and the MoltenVK tarball
+    # is an iOS binary. There are no /usr/local paths and no brew calls.
+    #
+    # The label is the x64 one because that is the one this repository's pool
+    # actually serves. On 2026-11-04 a switch to macos-15 was tried to escape
+    # a queue that turned out to be a GitHub Actions outage; once the outage
+    # cleared, the macos-15 job sat unassigned until it was cancelled while
+    # every earlier macos-15-intel run had been picked up. Revert when the
+    # arm64 pool is shown to work for this repository.
+    runs-on: macos-15-intel
 
     env:
       # --- private repositories (read-only access via READ_TOKEN) -----------
