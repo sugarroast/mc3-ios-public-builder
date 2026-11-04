@@ -40,7 +40,17 @@ jobs:
     # Standard GitHub-hosted macOS runner. Explicitly NOT a larger runner:
     # GitHub bills larger runners even for public repositories, which would
     # defeat the purpose of this repository.
-    runs-on: macos-15-intel
+    #
+    # arm64, not macos-15-intel. The target is iOS arm64 on a device, so the
+    # runner's own architecture only has to cross-compile, and the arm64
+    # image is the default pool -- macos-15-intel is the scarce label, and a
+    # run that waits for it never starts: on 2026-11-04 two runs sat at
+    # "Waiting for a runner to pick up this job..." for over 25 minutes after
+    # eleven earlier ones on the same label had completed. Nothing in this
+    # workflow needs Intel: CMake comes from a Python venv, SDL2 and glslang
+    # are built from source, and the MoltenVK tarball is an iOS binary. There
+    # are no /usr/local paths and no brew calls to differ between the images.
+    runs-on: macos-15
 
     env:
       # --- private repositories (read-only access via READ_TOKEN) -----------
